@@ -191,6 +191,8 @@ fn is_protected_customer_data_denial(error: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mentions_protected_data = message.contains("protected customer data")
+        || message.contains("protected-customer-data")
+        || message.contains("customer_data")
         || documentation.contains("protected-customer-data")
         || documentation.contains("customer_data");
     let is_denial = code == "ACCESS_DENIED"

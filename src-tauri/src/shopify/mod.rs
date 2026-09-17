@@ -31,7 +31,7 @@ pub struct ProductVariant {
     pub sku: Option<String>,
     pub price: String,
     pub currency_code: String,
-    pub inventory_quantity: i64,
+    pub inventory_quantity: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -243,7 +243,7 @@ struct VariantNode {
     title: String,
     sku: Option<String>,
     price: String,
-    inventory_quantity: i64,
+    inventory_quantity: Option<i64>,
     product: VariantProduct,
 }
 

@@ -32,6 +32,17 @@ fn connection_response() -> Value {
     }})
 }
 
+fn documented_protected_customer_data_response() -> Value {
+    json!({
+        "data": {"customers": {"nodes": []}},
+        "errors": [{
+            "message": "This app is not approved to use the phoneNumber field. See https://partners.shopify.com/123/apps/456/customer_data for more details.",
+            "locations": [],
+            "path": ["customers", "nodes", 0, "defaultPhoneNumber", "phoneNumber"]
+        }]
+    })
+}
+
 fn assert_redacted(error: &orderpilot_lib::error::AppError) {
     assert!(!format!("{error:?}").contains("shpat_secret"));
     assert!(!error.to_string().contains("shpat_secret"));
@@ -459,7 +470,7 @@ async fn search_variants_maps_products_to_selectable_variants() {
                     "title": "Navy / L",
                     "sku": null,
                     "price": "49.95",
-                    "inventoryQuantity": 0,
+                    "inventoryQuantity": null,
                     "product": {"title": "Hoodie"}
                 }
             ]}
@@ -481,8 +492,9 @@ async fn search_variants_maps_products_to_selectable_variants() {
     assert_eq!(rows[0].sku.as_deref(), Some("HD-NV-M"));
     assert_eq!(rows[0].price, "49.95");
     assert_eq!(rows[0].currency_code, "USD");
-    assert_eq!(rows[0].inventory_quantity, 7);
+    assert_eq!(rows[0].inventory_quantity, Some(7));
     assert_eq!(rows[1].sku, None);
+    assert_eq!(rows[1].inventory_quantity, None);
 
     let requests = server.received_requests().await.unwrap();
     let body: Value = requests[0].body_json().unwrap();
@@ -563,13 +575,9 @@ async fn search_customers_maps_nullable_contact_and_address_data() {
 async fn search_customers_reports_protected_customer_data_separately() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": {"customers": null},
-            "errors": [{
-                "message": "Access denied for customers field. Apps must be approved for protected customer data.",
-                "extensions": {"code": "ACCESS_DENIED"}
-            }]
-        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(documented_protected_customer_data_response()),
+        )
         .expect(1)
         .mount(&server)
         .await;
