@@ -4,6 +4,7 @@
 
 It follows the approved product scope:
 
+- an application switcher with `shopify create order` as the current function and room for future functions;
 - a fixed, searchable store sidebar;
 - masked Admin API Token status with a replacement action when credentials expire;
 - concrete product-variant selection and per-order quantity;
