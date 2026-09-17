@@ -10,6 +10,14 @@ pub struct AppError {
 }
 
 impl AppError {
+    pub(crate) fn transient(code: &'static str, message: &'static str) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
     pub fn validation(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
