@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use orderpilot_lib::{
-    batch::{BatchProgress, BatchService, ProgressSink, ReconciliationClock},
+    batch::{BatchProgress, BatchService, ForcedClaimGate, ProgressSink, ReconciliationClock},
     domain::{
         BatchItem, BatchItemStatus as Status, BatchSize, CustomerMode, FinancialStatus,
         OrderTemplate,
@@ -29,6 +29,20 @@ use tokio::sync::Notify;
 struct CreateGate {
     entered: Notify,
     release: Notify,
+}
+
+#[derive(Default)]
+struct ClaimGate {
+    entered: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl ForcedClaimGate for ClaimGate {
+    async fn before_claim(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
 }
 
 #[derive(Default)]
@@ -631,6 +645,57 @@ async fn force_retry_requires_confirmation_and_durably_records_it_before_submitt
 }
 
 #[tokio::test]
+async fn stop_before_forced_claim_prevents_submission_audit_and_status_override() {
+    let f = Fixture::batch(1).await;
+    let item = f.items().await.remove(0);
+    f.repo.mark_creating(&item.id).await.unwrap();
+    f.repo
+        .mark_uncertain(
+            &item.id,
+            &AppError::validation("SHOPIFY_TIMEOUT", "Unknown"),
+        )
+        .await
+        .unwrap();
+
+    let gate = Arc::new(ClaimGate::default());
+    let service = f.service.clone().with_forced_claim_gate(gate.clone());
+    let batch_id = f.batch_id.clone();
+    let item_id = item.id.clone();
+    let events = Arc::new(Events::default());
+    let force = tokio::spawn({
+        let events = events.clone();
+        async move {
+            service
+                .force_retry_uncertain(&batch_id, &item_id, false, true, events.as_ref())
+                .await
+        }
+    });
+
+    gate.entered.notified().await;
+    f.service
+        .request_stop(&f.batch_id, &f.events)
+        .await
+        .unwrap();
+    gate.release.notify_one();
+
+    assert_eq!(force.await.unwrap().unwrap_err().code(), "BATCH_STOPPED");
+    assert_eq!(f.gateway.calls.load(Ordering::SeqCst), 0);
+    assert!(f
+        .repo
+        .list_forced_retry_attempts(&f.batch_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let saved = f.items().await;
+    assert_eq!(saved[0].status, Status::Uncertain);
+    assert_eq!(saved[0].attempt_count, 1);
+    assert_eq!(
+        f.repo.get_batch(&f.batch_id).await.unwrap().status,
+        "paused"
+    );
+}
+
+#[tokio::test]
 async fn rejected_forced_attempt_does_not_erase_the_original_uncertainty() {
     for code in ["SHOPIFY_USER_ERROR", "SHOPIFY_FORBIDDEN"] {
         let f = Fixture::batch(1).await;
@@ -1029,3 +1094,4 @@ async fn interrupted_execution_requires_resume_before_failed_or_forced_retry() {
     assert_eq!(f.gateway.calls.load(Ordering::SeqCst), 1);
     assert_eq!(f.items().await[0].status, Status::Failed);
 }
+

@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -41,6 +44,19 @@ pub trait ReconciliationClock: Send + Sync {
     async fn wait(&self, duration: Duration);
 }
 
+/// Testable boundary immediately before a forced retry may claim an uncertain item.
+#[async_trait]
+pub trait ForcedClaimGate: Send + Sync {
+    async fn before_claim(&self);
+}
+
+struct ImmediateForcedClaimGate;
+
+#[async_trait]
+impl ForcedClaimGate for ImmediateForcedClaimGate {
+    async fn before_claim(&self) {}
+}
+
 struct TokioClock(tokio::time::Instant);
 #[async_trait]
 impl ReconciliationClock for TokioClock {
@@ -57,12 +73,20 @@ pub struct BatchService {
     repo: Repository,
     gateway: Arc<dyn ShopifyGateway>,
     clock: Arc<dyn ReconciliationClock>,
-    active: Arc<Mutex<HashMap<String, bool>>>,
+    active: Arc<Mutex<HashMap<String, Arc<BatchActivity>>>>,
+    forced_claim_gate: Arc<dyn ForcedClaimGate>,
+}
+
+#[derive(Default)]
+struct BatchActivity {
+    stop_requested: AtomicBool,
+    forced_claim: tokio::sync::Mutex<()>,
 }
 
 struct ActiveBatch {
     batch_id: String,
-    active: Arc<Mutex<HashMap<String, bool>>>,
+    active: Arc<Mutex<HashMap<String, Arc<BatchActivity>>>>,
+    activity: Arc<BatchActivity>,
 }
 impl Drop for ActiveBatch {
     fn drop(&mut self) {
@@ -83,11 +107,17 @@ impl BatchService {
             gateway,
             clock: Arc::new(TokioClock(tokio::time::Instant::now())),
             active: Arc::new(Mutex::new(HashMap::new())),
+            forced_claim_gate: Arc::new(ImmediateForcedClaimGate),
         })
     }
 
     pub fn with_reconciliation_clock(mut self, clock: Arc<dyn ReconciliationClock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    pub fn with_forced_claim_gate(mut self, gate: Arc<dyn ForcedClaimGate>) -> Self {
+        self.forced_claim_gate = gate;
         self
     }
 
@@ -180,16 +210,21 @@ impl BatchService {
         batch_id: &str,
         progress: &dyn ProgressSink,
     ) -> Result<(), AppError> {
-        // Keep the stop intent even when the durable write fails.
-        if let Some(stopped) = self
+        let activity = self
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_mut(batch_id)
-        {
-            *stopped = true;
-        }
-        let result = self.repo.stop_batch(batch_id).await;
+            .get(batch_id)
+            .cloned();
+        // Linearize stop against a forced claim and keep the in-memory intent even
+        // when the durable write fails.
+        let result = if let Some(activity) = activity {
+            let _claim = activity.forced_claim.lock().await;
+            activity.stop_requested.store(true, Ordering::SeqCst);
+            self.repo.stop_batch(batch_id).await
+        } else {
+            self.repo.stop_batch(batch_id).await
+        };
         self.finish_operation(batch_id, progress, result).await?;
         self.emit(batch_id, progress).await
     }
@@ -269,8 +304,22 @@ impl BatchService {
                         .ok_or_else(|| AppError::validation("STORE_NOT_FOUND", "未找到店铺"))?,
                 )
                 .await?;
-            self.repo.set_batch_status(batch_id, "running").await?;
-            self.repo.claim_forced_attempt(batch_id, item_id).await?;
+            self.forced_claim_gate.before_claim().await;
+            {
+                let _claim = _active.activity.forced_claim.lock().await;
+                if _active.activity.stop_requested.load(Ordering::SeqCst)
+                    || matches!(
+                        self.repo.get_batch(batch_id).await?.status.as_str(),
+                        "stopping" | "paused"
+                    )
+                {
+                    return Err(AppError::validation(
+                        "BATCH_STOPPED",
+                        "批次已停止，未执行强制重试",
+                    ));
+                }
+                self.repo.claim_forced_attempt(batch_id, item_id).await?;
+            }
             self.submit(&item, &store, input, progress).await?;
             self.finish_batch(batch_id, progress).await
         }
@@ -289,10 +338,12 @@ impl BatchService {
                 "此批次正在执行，请等待当前操作完成",
             ));
         }
-        active.insert(batch_id.into(), false);
+        let activity = Arc::new(BatchActivity::default());
+        active.insert(batch_id.into(), activity.clone());
         Ok(ActiveBatch {
             batch_id: batch_id.into(),
             active: self.active.clone(),
+            activity,
         })
     }
 
@@ -301,8 +352,7 @@ impl BatchService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(batch_id)
-            .copied()
-            .unwrap_or(false)
+            .is_some_and(|activity| activity.stop_requested.load(Ordering::SeqCst))
     }
 
     async fn require_recovered_batch(&self, batch_id: &str) -> Result<(), AppError> {
@@ -541,3 +591,4 @@ fn sanitize_order(mut order: CreatedOrder, store: &StoreCredentials) -> CreatedO
     }
     order
 }
+

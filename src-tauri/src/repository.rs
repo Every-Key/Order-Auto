@@ -86,6 +86,14 @@ impl Repository {
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let activated = sqlx::query("UPDATE batch_jobs SET status = 'running', started_at = COALESCE(started_at, ?), finished_at = NULL WHERE id = ? AND status IN ('pending', 'completed_with_errors')")
+            .bind(&now).bind(batch_id).execute(&mut *transaction).await.map_err(database_error)?;
+        if activated.rows_affected() == 0 {
+            return Err(AppError::validation(
+                "BATCH_STOPPED",
+                "批次已停止，未执行强制重试",
+            ));
+        }
         let attempt: Option<i64> = sqlx::query_scalar("UPDATE batch_items SET status = 'creating', attempt_count = attempt_count + 1, error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ? AND batch_id = ? AND status = 'uncertain' AND EXISTS (SELECT 1 FROM batch_jobs WHERE id = batch_items.batch_id AND status = 'running') RETURNING attempt_count")
             .bind(&now).bind(item_id).bind(batch_id).fetch_optional(&mut *transaction).await.map_err(database_error)?;
         let attempt = attempt.ok_or_else(|| {
@@ -510,3 +518,4 @@ mod tests {
         assert_eq!(options.get_max_lifetime(), None);
     }
 }
+
