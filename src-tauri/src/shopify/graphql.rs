@@ -116,6 +116,13 @@ struct OrderUserError {
 impl CreateOrderData {
     pub(crate) fn into_order(self) -> Result<CreatedOrder, AppError> {
         if !self.order_create.user_errors.is_empty() {
+            // A returned order may already exist remotely despite accompanying errors.
+            // Only an explicit no-order response is safe for ordinary failed-item retry.
+            let code = if self.order_create.order.is_some() {
+                "SHOPIFY_ORDER_OUTCOME_UNCERTAIN"
+            } else {
+                "SHOPIFY_USER_ERROR"
+            };
             let messages = self
                 .order_create
                 .user_errors
@@ -127,7 +134,7 @@ impl CreateOrderData {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(AppError::validation("SHOPIFY_USER_ERROR", messages));
+            return Err(AppError::validation(code, messages));
         }
         self.order_create
             .order
@@ -746,9 +753,9 @@ mod order_response_tests {
     }
 
     #[test]
-    fn order_user_errors_take_precedence_and_preserve_codes_and_messages() {
+    fn definite_order_rejection_preserves_user_error_codes_and_messages() {
         let data: CreateOrderData = serde_json::from_value(json!({"orderCreate": {
-            "order": {"id": "gid://shopify/Order/42", "name": "#1042"},
+            "order": null,
             "userErrors": [
                 {"field": ["order", "shippingAddress"], "message": "Invalid address", "code": "INVALID"},
                 {"field": null, "message": "Variant unavailable", "code": "VARIANT_NOT_FOUND"}
@@ -761,5 +768,24 @@ mod order_response_tests {
         assert!(error.message().contains("VARIANT_NOT_FOUND"));
         assert!(error.message().contains("Variant unavailable"));
         assert!(!error.retryable());
+    }
+
+    #[test]
+    fn mixed_order_and_user_errors_are_ambiguous_not_a_definite_rejection() {
+        for order in [
+            json!({"id": "gid://shopify/Order/42", "name": "#1042"}),
+            json!({"id": "", "name": "#1042"}),
+            json!({"id": "gid://shopify/Order/42", "name": ""}),
+        ] {
+            let data: CreateOrderData = serde_json::from_value(json!({"orderCreate": {
+                "order": order,
+                "userErrors": [{"field": ["order"], "message": "Mixed outcome", "code": "INVALID"}]
+            }}))
+            .unwrap();
+            let error = data.into_order().unwrap_err();
+            assert_eq!(error.code(), "SHOPIFY_ORDER_OUTCOME_UNCERTAIN");
+            assert!(error.message().contains("Mixed outcome"));
+            assert!(!error.retryable());
+        }
     }
 }

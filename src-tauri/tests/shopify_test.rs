@@ -1,9 +1,12 @@
 use async_trait::async_trait;
-use orderpilot_lib::domain::{CustomerMode, FinancialStatus, OrderTemplate};
+use orderpilot_lib::batch::{BatchProgress, BatchService, ProgressSink, ReconciliationClock};
+use orderpilot_lib::domain::{
+    BatchItemStatus, BatchSize, CustomerMode, FinancialStatus, OrderTemplate,
+};
 use orderpilot_lib::shopify::graphql::RetryWaiter;
 use orderpilot_lib::shopify::CreateOrderInput;
 use orderpilot_lib::{
-    repository::StoreCredentials,
+    repository::{NewStore, Repository, StoreCredentials},
     shopify::{ShopifyGateway, ShopifyHttpClient},
 };
 use secrecy::SecretString;
@@ -13,11 +16,77 @@ use std::{
     time::Duration,
 };
 use wiremock::{
-    matchers::{header, method, path},
+    matchers::{body_string_contains, header, method, path},
     Mock, MockServer, ResponseTemplate,
 };
 
 const BATCH_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+#[tokio::test]
+async fn mixed_order_and_user_errors_remain_uncertain_and_ordinary_retry_cannot_resubmit() {
+    struct NoEvents;
+    impl ProgressSink for NoEvents {
+        fn emit(&self, _: BatchProgress) {}
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("mutation CreateOrder"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "orderCreate": {
+                "order": {"id": "gid://shopify/Order/42", "name": "#1042"},
+                "userErrors": [{"field": ["order"], "message": "Mixed outcome", "code": "INVALID"}]
+            }
+        }})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("query FindOrderBySource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "orders": {"nodes": [], "pageInfo": {"hasNextPage": false}}
+        }})))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let repo = Repository::connect(":memory:").await.unwrap();
+    let store_id = repo
+        .create_store(NewStore {
+            display_name: "Test".into(),
+            shop_domain: "test-shop".into(),
+            access_token: SecretString::from("shpat_secret"),
+        })
+        .await
+        .unwrap();
+    let batch = repo
+        .create_batch(&store_id, order_template(), BatchSize::new(1).unwrap())
+        .await
+        .unwrap();
+    let service = BatchService::new(
+        repo.clone(),
+        Arc::new(ShopifyHttpClient::new(Some(server.uri())).unwrap()),
+    )
+    .await
+    .unwrap()
+    .with_reconciliation_clock(Arc::new(RecordingWaiter::default()));
+
+    service.run(&batch.id, false, &NoEvents).await.unwrap();
+    let item = repo.list_batch_items(&batch.id).await.unwrap().remove(0);
+    assert_eq!(item.status, BatchItemStatus::Uncertain);
+    assert_eq!(
+        item.error_code.as_deref(),
+        Some("SHOPIFY_ORDER_OUTCOME_UNCERTAIN")
+    );
+    assert_eq!(item.attempt_count, 1);
+    service
+        .retry_failed(&batch.id, false, &NoEvents)
+        .await
+        .unwrap();
+    let after_retry = repo.list_batch_items(&batch.id).await.unwrap().remove(0);
+    assert_eq!(after_retry.status, BatchItemStatus::Uncertain);
+    assert_eq!(after_retry.attempt_count, 1);
+    server.verify().await;
+}
 
 #[tokio::test]
 async fn create_order_never_replays_ambiguous_http_server_failures() {
@@ -609,6 +678,17 @@ struct RecordingWaiter(Mutex<Vec<Duration>>);
 impl RetryWaiter for RecordingWaiter {
     async fn wait(&self, delay: Duration) {
         self.0.lock().unwrap().push(delay);
+    }
+}
+
+#[async_trait]
+impl ReconciliationClock for RecordingWaiter {
+    fn now(&self) -> Duration {
+        self.0.lock().unwrap().iter().sum()
+    }
+
+    async fn wait(&self, delay: Duration) {
+        RetryWaiter::wait(self, delay).await;
     }
 }
 
