@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::AppError;
 
@@ -18,7 +18,7 @@ pub fn normalize_shop_domain(raw: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::validation("INVALID_SHOP_DOMAIN", "请输入有效的 Shopify 店铺域名"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct BatchSize(u16);
 
@@ -32,6 +32,16 @@ impl BatchSize {
 
     pub fn get(self) -> u16 {
         self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for BatchSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u16::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -63,21 +73,32 @@ pub enum CustomerMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManualCustomer {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub first_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shipping_address: Option<MailingAddress>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailingAddress {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub address1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub address2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub province: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub zip: Option<String>,
 }
 
@@ -116,5 +137,37 @@ mod tests {
         assert!(BatchSize::new(100).is_ok());
         assert!(BatchSize::new(0).is_err());
         assert!(BatchSize::new(101).is_err());
+    }
+
+    #[test]
+    fn batch_size_deserialization_rejects_values_outside_the_invariant() {
+        for json in ["0", "101", "65535"] {
+            assert!(serde_json::from_str::<BatchSize>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn batch_size_deserialization_accepts_valid_boundaries() {
+        assert_eq!(serde_json::from_str::<BatchSize>("1").unwrap().get(), 1);
+        assert_eq!(serde_json::from_str::<BatchSize>("100").unwrap().get(), 100);
+    }
+
+    #[test]
+    fn absent_customer_and_address_fields_are_omitted_from_json() {
+        let customer = CustomerMode::Manual {
+            customer: ManualCustomer::default(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(customer).unwrap(),
+            serde_json::json!({
+                "mode": "manual",
+                "customer": {},
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(MailingAddress::default()).unwrap(),
+            serde_json::json!({})
+        );
     }
 }
