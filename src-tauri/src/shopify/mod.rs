@@ -61,6 +61,11 @@ pub struct CustomerAddress {
 /// Shopify operations cross this seam while credentials and transport stay in Rust.
 #[async_trait]
 pub trait ShopifyGateway: Send + Sync {
+    async fn find_order_by_source(
+        &self,
+        store: &StoreCredentials,
+        source: &str,
+    ) -> Result<Option<CreatedOrder>, AppError>;
     async fn create_order(
         &self,
         store: &StoreCredentials,
@@ -82,17 +87,23 @@ pub trait ShopifyGateway: Send + Sync {
 
 #[async_trait]
 impl ShopifyGateway for ShopifyHttpClient {
+    async fn find_order_by_source(
+        &self,
+        store: &StoreCredentials,
+        source: &str,
+    ) -> Result<Option<CreatedOrder>, AppError> {
+        graphql::source_batch_id(source)?;
+        let data: graphql::FindOrderData = self.execute_once(store, graphql::FIND_ORDER_QUERY, &serde_json::json!({"query": format!("source_identifier:\"{}\"", escape_search_term(source))})).await?;
+        data.into_order(source)
+    }
+
     async fn create_order(
         &self,
         store: &StoreCredentials,
         input: CreateOrderInput,
     ) -> Result<CreatedOrder, AppError> {
         let data: graphql::CreateOrderData = self
-            .execute(
-                store,
-                graphql::CREATE_ORDER_MUTATION,
-                &serde_json::json!({"order": input}),
-            )
+            .execute_order_mutation(store, &serde_json::json!({"order": input}))
             .await?;
         data.into_order()
     }

@@ -60,7 +60,93 @@ pub struct BatchSummary {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct ForcedRetryAttempt {
+    pub item_id: String,
+    pub attempt_number: i64,
+    pub risk_confirmed: bool,
+    pub confirmed_at: String,
+}
+
 impl Repository {
+    pub async fn list_forced_retry_attempts(
+        &self,
+        batch_id: &str,
+    ) -> Result<Vec<ForcedRetryAttempt>, AppError> {
+        sqlx::query_as("SELECT a.* FROM forced_retry_attempts a JOIN batch_items i ON i.id = a.item_id WHERE i.batch_id = ? ORDER BY i.sequence_number, a.attempt_number")
+            .bind(batch_id).fetch_all(&self.pool).await.map_err(database_error)
+    }
+
+    /// The audit and claim commit together, before the caller may send the mutation.
+    pub(crate) async fn claim_forced_attempt(
+        &self,
+        batch_id: &str,
+        item_id: &str,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let attempt: Option<i64> = sqlx::query_scalar("UPDATE batch_items SET status = 'creating', attempt_count = attempt_count + 1, error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ? AND batch_id = ? AND status = 'uncertain' AND EXISTS (SELECT 1 FROM batch_jobs WHERE id = batch_items.batch_id AND status = 'running') RETURNING attempt_count")
+            .bind(&now).bind(item_id).bind(batch_id).fetch_optional(&mut *transaction).await.map_err(database_error)?;
+        let attempt = attempt.ok_or_else(|| {
+            AppError::validation(
+                "INVALID_ITEM_TRANSITION",
+                "仅结果待确认的批次项允许强制重试",
+            )
+        })?;
+        sqlx::query("INSERT INTO forced_retry_attempts (item_id, attempt_number, risk_confirmed, confirmed_at) VALUES (?, ?, 1, ?)")
+            .bind(item_id).bind(attempt).bind(now).execute(&mut *transaction).await.map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)
+    }
+
+    pub(crate) async fn stop_batch(&self, batch_id: &str) -> Result<(), AppError> {
+        self.get_batch(batch_id).await?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("UPDATE batch_jobs SET status = CASE WHEN status = 'running' THEN 'stopping' ELSE 'paused' END WHERE id = ? AND status NOT IN ('completed', 'completed_with_errors')")
+            .bind(batch_id).execute(&mut *transaction).await.map_err(database_error)?;
+        sqlx::query("UPDATE batch_items SET status = 'stopped', updated_at = ? WHERE batch_id = ? AND status = 'queued'")
+            .bind(Utc::now().to_rfc3339()).bind(batch_id).execute(&mut *transaction).await.map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)
+    }
+
+    pub(crate) async fn resume_stopped_items(&self, batch_id: &str) -> Result<(), AppError> {
+        sqlx::query("UPDATE batch_items SET status = 'queued', updated_at = ? WHERE batch_id = ? AND status = 'stopped'")
+            .bind(Utc::now().to_rfc3339()).bind(batch_id).execute(&self.pool).await.map_err(database_error)?;
+        Ok(())
+    }
+
+    pub(crate) async fn requeue_failed_items(
+        &self,
+        batch_id: &str,
+    ) -> Result<Vec<String>, AppError> {
+        sqlx::query_scalar("UPDATE batch_items SET status = 'queued', error_code = NULL, error_message = NULL, updated_at = ? WHERE batch_id = ? AND status = 'failed' RETURNING id")
+            .bind(Utc::now().to_rfc3339()).bind(batch_id).fetch_all(&self.pool).await.map_err(database_error)
+    }
+
+    /// Claim is atomic with respect to stop, which updates the parent and queued rows together.
+    pub(crate) async fn claim_for_execution(&self, item_id: &str) -> Result<bool, AppError> {
+        let result = sqlx::query("UPDATE batch_items SET status = 'creating', attempt_count = attempt_count + 1, error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ? AND status = 'queued' AND EXISTS (SELECT 1 FROM batch_jobs WHERE id = batch_items.batch_id AND status = 'running')")
+            .bind(Utc::now().to_rfc3339()).bind(item_id).execute(&self.pool).await.map_err(database_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn recover_interrupted(&self, batch_id: Option<&str>) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("UPDATE batch_jobs SET status = 'paused', finished_at = NULL WHERE (? IS NULL OR id = ?) AND (status IN ('running', 'stopping') OR EXISTS (SELECT 1 FROM batch_items WHERE batch_id = batch_jobs.id AND status = 'creating'))")
+            .bind(batch_id).bind(batch_id).execute(&mut *transaction).await.map_err(database_error)?;
+        sqlx::query("UPDATE batch_items SET status = 'uncertain', error_code = 'PROCESS_INTERRUPTED', error_message = '创建请求被中断，请核对 Shopify 订单结果', updated_at = ? WHERE status = 'creating' AND (? IS NULL OR batch_id = ?)")
+            .bind(Utc::now().to_rfc3339()).bind(batch_id).bind(batch_id).execute(&mut *transaction).await.map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)
+    }
+
+    pub(crate) async fn set_batch_status(&self, id: &str, status: &str) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE batch_jobs SET status = ?, started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END, finished_at = CASE WHEN ? IN ('completed', 'completed_with_errors') THEN ? ELSE NULL END WHERE id = ?")
+            .bind(status).bind(status).bind(&now).bind(status).bind(&now).bind(id)
+            .execute(&self.pool).await.map_err(database_error)?;
+        Ok(())
+    }
+
     /// Observation only: callers must successfully mark_creating before submitting.
     pub async fn next_queued_item(&self, batch_id: &str) -> Result<Option<BatchItem>, AppError> {
         sqlx::query_as::<_, BatchItem>("SELECT * FROM batch_items WHERE batch_id = ? AND status = 'queued' ORDER BY sequence_number LIMIT 1")
@@ -101,6 +187,32 @@ impl Repository {
         self.transition_item(id, ItemTransition::Stopped).await
     }
 
+    /// Only for a live, explicit rejection before order execution; never crash recovery.
+    pub(crate) async fn requeue_rejected_item(
+        &self,
+        id: &str,
+        error: &AppError,
+    ) -> Result<(), AppError> {
+        self.transition_item(id, ItemTransition::Rejected(error))
+            .await
+    }
+
+    pub(crate) async fn record_reconciled_order(
+        &self,
+        id: &str,
+        order_id: &str,
+        order_name: &str,
+    ) -> Result<(), AppError> {
+        self.transition_item(
+            id,
+            ItemTransition::Reconciled {
+                order_id,
+                order_name,
+            },
+        )
+        .await
+    }
+
     async fn transition_item(
         &self,
         id: &str,
@@ -116,6 +228,11 @@ impl Repository {
             ItemTransition::Failed(error) => (Creating, Failed, None, None, Some(error)),
             ItemTransition::Uncertain(error) => (Creating, Uncertain, None, None, Some(error)),
             ItemTransition::Stopped => (Queued, Stopped, None, None, None),
+            ItemTransition::Rejected(error) => (Creating, Queued, None, None, Some(error)),
+            ItemTransition::Reconciled {
+                order_id,
+                order_name,
+            } => (Uncertain, Succeeded, Some(order_id), Some(order_name), None),
         };
         // A conditional single write guards concurrent callers and keeps results/timestamp atomic.
         let result = sqlx::query("UPDATE batch_items SET status = ?, attempt_count = attempt_count + ?, shopify_order_id = ?, shopify_order_name = ?, error_code = ?, error_message = ?, updated_at = ? WHERE id = ? AND status = ?")
@@ -349,6 +466,11 @@ enum ItemTransition<'a> {
     Failed(&'a AppError),
     Uncertain(&'a AppError),
     Stopped,
+    Rejected(&'a AppError),
+    Reconciled {
+        order_id: &'a str,
+        order_name: &'a str,
+    },
 }
 
 fn escape_like(value: &str) -> String {

@@ -10,6 +10,14 @@ pub struct AppError {
 }
 
 impl AppError {
+    pub(crate) fn redacted(mut self, secret: &str) -> Self {
+        if !secret.is_empty() {
+            self.code = self.code.replace(secret, "[REDACTED]");
+            self.message = self.message.replace(secret, "[REDACTED]");
+        }
+        self
+    }
+
     pub(crate) fn transient(code: &'static str, message: &'static str) -> Self {
         Self {
             code: code.into(),

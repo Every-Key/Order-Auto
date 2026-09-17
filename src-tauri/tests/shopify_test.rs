@@ -19,6 +19,224 @@ use wiremock::{
 
 const BATCH_ID: &str = "00000000-0000-4000-8000-000000000001";
 
+#[tokio::test]
+async fn create_order_never_replays_ambiguous_http_server_failures() {
+    for status in [500, 502, 503, 599] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let waiter = Arc::new(RecordingWaiter::default());
+        let error = ShopifyHttpClient::new(Some(server.uri()))
+            .unwrap()
+            .with_retry_waiter(waiter.clone())
+            .create_order(
+                &credentials(),
+                CreateOrderInput::from_template(
+                    order_template(),
+                    &format!("orderpilot/{BATCH_ID}/1"),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "SHOPIFY_SERVER_ERROR");
+        assert!(!error.retryable(), "ambiguous mutations must be reconciled");
+        assert!(waiter.0.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn create_order_retries_only_explicit_throttling_up_to_three_attempts() {
+    for graphql in [false, true] {
+        let server = MockServer::start().await;
+        let body = json!({"errors": [{"extensions": {"code": "THROTTLED"}}], "extensions": {"cost": {"requestedQueryCost": 100, "throttleStatus": {"currentlyAvailable": 0, "restoreRate": 25}}}});
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(if graphql { 200 } else { 429 })
+                    .insert_header("Retry-After", "2")
+                    .set_body_json(body),
+            )
+            .expect(3)
+            .mount(&server)
+            .await;
+        let waiter = Arc::new(RecordingWaiter::default());
+        let error = ShopifyHttpClient::new(Some(server.uri()))
+            .unwrap()
+            .with_retry_waiter(waiter.clone())
+            .create_order(
+                &credentials(),
+                CreateOrderInput::from_template(
+                    order_template(),
+                    &format!("orderpilot/{BATCH_ID}/1"),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "SHOPIFY_RATE_LIMITED");
+        assert_eq!(
+            *waiter.0.lock().unwrap(),
+            vec![Duration::from_secs(4), Duration::from_secs(4)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_order_does_not_replay_partial_throttle_or_internal_graphql_errors() {
+    for body in [
+        json!({"data": {"orderCreate": {"order": {"id": "gid://shopify/Order/42", "name": "#42"}, "userErrors": []}}, "errors": [{"extensions": {"code": "THROTTLED"}}]}),
+        json!({"errors": [{"extensions": {"code": "INTERNAL_SERVER_ERROR"}}]}),
+        json!({"errors": [{"extensions": {"code": "THROTTLED"}}, {"extensions": {"code": "INTERNAL_SERVER_ERROR"}}]}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let waiter = Arc::new(RecordingWaiter::default());
+        let error = ShopifyHttpClient::new(Some(server.uri()))
+            .unwrap()
+            .with_retry_waiter(waiter.clone())
+            .create_order(
+                &credentials(),
+                CreateOrderInput::from_template(
+                    order_template(),
+                    &format!("orderpilot/{BATCH_ID}/1"),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "SHOPIFY_GRAPHQL");
+        assert!(!error.retryable());
+        assert!(waiter.0.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn source_lookup_does_not_hide_extra_transport_attempts_in_one_reconciliation_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let waiter = Arc::new(RecordingWaiter::default());
+    let error = ShopifyHttpClient::new(Some(server.uri()))
+        .unwrap()
+        .with_retry_waiter(waiter.clone())
+        .find_order_by_source(&credentials(), &format!("orderpilot/{BATCH_ID}/1"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "SHOPIFY_SERVER_ERROR");
+    assert!(waiter.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn create_order_timeout_is_ambiguous_and_never_replayed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"orderCreate": {"order": {"id": "gid://shopify/Order/42", "name": "#42"}, "userErrors": []}}})).set_delay(Duration::from_secs(60))).expect(1).mount(&server).await;
+    let waiter = Arc::new(RecordingWaiter::default());
+    let client = ShopifyHttpClient::new(Some(server.uri()))
+        .unwrap()
+        .with_retry_waiter(waiter.clone());
+    let task = tokio::spawn(async move {
+        client
+            .create_order(
+                &credentials(),
+                CreateOrderInput::from_template(
+                    order_template(),
+                    &format!("orderpilot/{BATCH_ID}/1"),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.received_requests().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let error = task.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), "SHOPIFY_TIMEOUT");
+    assert!(!error.retryable());
+    assert!(waiter.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn create_order_connection_loss_after_receiving_request_is_never_replayed() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 8192];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        // The server may have created the order; lose the response connection.
+    });
+    let waiter = Arc::new(RecordingWaiter::default());
+    let error = ShopifyHttpClient::new(Some(origin))
+        .unwrap()
+        .with_retry_waiter(waiter.clone())
+        .create_order(
+            &credentials(),
+            CreateOrderInput::from_template(
+                order_template(),
+                &format!("orderpilot/{BATCH_ID}/1"),
+                false,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    peer.await.unwrap();
+    assert_eq!(error.code(), "SHOPIFY_NETWORK");
+    assert!(!error.retryable());
+    assert!(waiter.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn find_order_by_source_uses_a_variable_and_verifies_the_exact_source() {
+    let source = format!("orderpilot/{BATCH_ID}/1");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/api/2026-07/graphql.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"orders": {
+            "nodes": [{"id": "gid://shopify/Order/42", "name": "#1042", "sourceIdentifier": source}],
+            "pageInfo": {"hasNextPage": false}
+        }}}))).expect(1).mount(&server).await;
+    let order = ShopifyHttpClient::new(Some(server.uri()))
+        .unwrap()
+        .find_order_by_source(&credentials(), &source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(order.name, "#1042");
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    let query = body["query"].as_str().unwrap();
+    assert!(query.contains("orders(first: 2, query: $query)"));
+    assert!(query.contains("sourceIdentifier"));
+    assert!(!query.contains(&source));
+    assert_eq!(
+        body["variables"]["query"],
+        format!("source_identifier:\"{source}\"")
+    );
+}
+
 fn order_template() -> OrderTemplate {
     OrderTemplate {
         variant_id: "gid://shopify/ProductVariant/123".into(),

@@ -13,6 +13,56 @@ fn template() -> OrderTemplate {
 }
 
 #[tokio::test]
+async fn forced_attempt_migration_upgrades_v1_without_changing_existing_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let previous_migrations = directory.path().join("v1-migrations");
+    std::fs::create_dir(&previous_migrations).unwrap();
+    std::fs::write(
+        previous_migrations.join("0001_init.sql"),
+        include_str!("../migrations/0001_init.sql"),
+    )
+    .unwrap();
+    let database = directory.path().join("legacy.sqlite");
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    sqlx::migrate::Migrator::new(previous_migrations.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO stores (id, display_name, shop_domain, access_token, created_at, updated_at) VALUES ('legacy-store', 'Legacy', 'legacy.myshopify.com', 'shpat_fixture', '2026-09-16', '2026-09-16')").execute(&pool).await.unwrap();
+    let batch_id = "00000000-0000-4000-8000-000000000001";
+    sqlx::query("INSERT INTO batch_jobs (id, store_id, order_template_json, requested_count, status, created_at) VALUES (?, 'legacy-store', ?, 1, 'completed', '2026-09-16')")
+        .bind(batch_id).bind(serde_json::to_string(&template()).unwrap()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO batch_items (id, batch_id, sequence_number, source_identifier, status, attempt_count, shopify_order_id, shopify_order_name, created_at, updated_at) VALUES ('legacy-item', ?, 1, ?, 'succeeded', 1, 'gid://shopify/Order/42', '#42', '2026-09-16', '2026-09-16')")
+        .bind(batch_id).bind(format!("orderpilot/{batch_id}/1")).execute(&pool).await.unwrap();
+    pool.close().await;
+    let repo = Repository::connect(&database).await.unwrap();
+    assert_eq!(repo.search_stores("Legacy").await.unwrap().len(), 1);
+    assert_eq!(repo.get_batch(batch_id).await.unwrap().status, "completed");
+    let items = repo.list_batch_items(batch_id).await.unwrap();
+    assert_eq!(items[0].shopify_order_name.as_deref(), Some("#42"));
+    assert!(repo
+        .list_forced_retry_attempts(batch_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let reopened = Repository::connect(&database).await.unwrap();
+    assert_eq!(reopened.list_batch_items(batch_id).await.unwrap(), items);
+    assert!(reopened
+        .list_forced_retry_attempts(batch_id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn batch_items_allow_only_legal_transitions_and_persist_results() {
     use orderpilot_lib::domain::BatchItemStatus as Status;
     use orderpilot_lib::error::AppError;
