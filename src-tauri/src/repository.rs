@@ -64,8 +64,7 @@ impl Repository {
             .in_memory(in_memory)
             .create_if_missing(true)
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(if in_memory { 1 } else { 5 })
+        let pool = pool_options(in_memory)
             .connect_with(options)
             .await
             .map_err(database_error)?;
@@ -223,10 +222,33 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
+fn pool_options(in_memory: bool) -> SqlitePoolOptions {
+    let options = SqlitePoolOptions::new().max_connections(if in_memory { 1 } else { 5 });
+    if in_memory {
+        options.idle_timeout(None).max_lifetime(None)
+    } else {
+        options
+    }
+}
+
 fn database_error(_: impl std::fmt::Display) -> AppError {
     AppError::validation("DATABASE_ERROR", "本地数据库操作失败")
 }
 
 fn store_not_found() -> AppError {
     AppError::validation("STORE_NOT_FOUND", "未找到店铺")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_memory_pool_never_retires_its_only_connection() {
+        let options = pool_options(true);
+
+        assert_eq!(options.get_max_connections(), 1);
+        assert_eq!(options.get_idle_timeout(), None);
+        assert_eq!(options.get_max_lifetime(), None);
+    }
 }
