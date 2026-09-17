@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use orderpilot_lib::domain::{CustomerMode, FinancialStatus, OrderTemplate};
 use orderpilot_lib::shopify::graphql::RetryWaiter;
+use orderpilot_lib::shopify::CreateOrderInput;
 use orderpilot_lib::{
     repository::StoreCredentials,
     shopify::{ShopifyGateway, ShopifyHttpClient},
@@ -14,6 +16,256 @@ use wiremock::{
     matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
 };
+
+const BATCH_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+fn order_template() -> OrderTemplate {
+    OrderTemplate {
+        variant_id: "gid://shopify/ProductVariant/123".into(),
+        quantity: 2,
+        customer: CustomerMode::None,
+        financial_status: FinancialStatus::Pending,
+    }
+}
+
+#[test]
+fn order_input_rejects_invalid_variant_quantity_customer_and_source() {
+    let source = format!("orderpilot/{BATCH_ID}/1");
+    for quantity in [0, u32::MAX] {
+        let mut template = order_template();
+        template.quantity = quantity;
+        assert_eq!(
+            CreateOrderInput::from_template(template, &source, false)
+                .unwrap_err()
+                .code(),
+            "INVALID_ORDER_QUANTITY"
+        );
+    }
+    for variant in [
+        "",
+        "gid://shopify/Product/123",
+        "gid://shopify/ProductVariant/",
+    ] {
+        let mut template = order_template();
+        template.variant_id = variant.into();
+        assert_eq!(
+            CreateOrderInput::from_template(template, &source, false)
+                .unwrap_err()
+                .code(),
+            "INVALID_VARIANT_ID"
+        );
+    }
+    let mut template = order_template();
+    template.customer = CustomerMode::Existing {
+        customer_id: " ".into(),
+    };
+    assert_eq!(
+        CreateOrderInput::from_template(template, &source, false)
+            .unwrap_err()
+            .code(),
+        "INVALID_CUSTOMER_ID"
+    );
+    for source in [
+        "source-1".into(),
+        "orderpilot/not-a-uuid/1".into(),
+        format!("orderpilot/{BATCH_ID}/0"),
+        format!("orderpilot/{BATCH_ID}/101"),
+        format!("orderpilot/{BATCH_ID}/01"),
+        format!("orderpilot/{BATCH_ID}/1/extra"),
+    ] {
+        assert_eq!(
+            CreateOrderInput::from_template(order_template(), &source, false)
+                .unwrap_err()
+                .code(),
+            "INVALID_SOURCE_IDENTIFIER"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_order_sends_typed_mutation_and_returns_gid_and_name() {
+    let server = MockServer::start().await;
+    let source = format!("orderpilot/{BATCH_ID}/1");
+    Mock::given(method("POST"))
+        .and(path("/admin/api/2026-07/graphql.json"))
+        .and(header("X-Shopify-Access-Token", "shpat_secret"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": {"orderCreate": {
+                "order": {"id": "gid://shopify/Order/42", "name": "#1042"}, "userErrors": []
+            }}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let order = ShopifyHttpClient::new(Some(server.uri()))
+        .unwrap()
+        .create_order(
+            &credentials(),
+            CreateOrderInput::from_template(order_template(), &source, false).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(order.id, "gid://shopify/Order/42");
+    assert_eq!(order.name, "#1042");
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let query = body["query"].as_str().unwrap();
+    assert!(query.contains("$order: OrderCreateOrderInput!"));
+    assert!(query.contains("orderCreate(order: $order)"));
+    assert!(query.contains("userErrors { field message code }"));
+    assert!(!query.contains(&source));
+    assert_eq!(body["variables"]["order"]["sourceIdentifier"], source);
+    assert_eq!(body["variables"]["order"]["lineItems"][0]["quantity"], 2);
+}
+
+#[tokio::test]
+async fn create_order_user_errors_are_non_retryable_and_redacted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"orderCreate": {
+            "order": null,
+            "userErrors": [{"field": ["order", "email"], "message": "Invalid email shpat_secret", "code": "INVALID"}]
+        }}}))).expect(1).mount(&server).await;
+    let error = ShopifyHttpClient::new(Some(server.uri()))
+        .unwrap()
+        .create_order(
+            &credentials(),
+            CreateOrderInput::from_template(
+                order_template(),
+                &format!("orderpilot/{BATCH_ID}/1"),
+                false,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "SHOPIFY_USER_ERROR");
+    assert!(error.message().contains("INVALID"));
+    assert!(error.message().contains("Invalid email"));
+    assert!(!error.retryable());
+    assert_redacted(&error);
+}
+
+#[tokio::test]
+async fn create_order_missing_result_is_invalid_and_not_retried() {
+    for payload in [
+        json!({"order": null, "userErrors": []}),
+        json!({"order": {"id": "gid://shopify/Order/42"}, "userErrors": []}),
+        json!({"order": {"id": "gid://shopify/Order/42", "name": "#1042"}}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"orderCreate": payload}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = ShopifyHttpClient::new(Some(server.uri()))
+            .unwrap()
+            .create_order(
+                &credentials(),
+                CreateOrderInput::from_template(
+                    order_template(),
+                    &format!("orderpilot/{BATCH_ID}/1"),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "SHOPIFY_INVALID_RESPONSE");
+        assert!(!error.retryable());
+    }
+}
+
+#[test]
+fn paid_order_requires_explicit_confirmation() {
+    let mut template = order_template();
+    template.financial_status = FinancialStatus::Paid;
+    assert_eq!(
+        CreateOrderInput::from_template(template.clone(), "source-1", false)
+            .unwrap_err()
+            .code(),
+        "PAID_CONFIRMATION_REQUIRED"
+    );
+    let source = format!("orderpilot/{BATCH_ID}/1");
+    let paid = CreateOrderInput::from_template(template, &source, true).unwrap();
+    assert_eq!(
+        serde_json::to_value(paid).unwrap()["financialStatus"],
+        "PAID"
+    );
+    let pending = CreateOrderInput::from_template(order_template(), &source, false).unwrap();
+    assert_eq!(
+        serde_json::to_value(pending).unwrap(),
+        json!({
+            "lineItems": [{"variantId": "gid://shopify/ProductVariant/123", "quantity": 2}],
+            "financialStatus": "PENDING",
+            "sourceIdentifier": source,
+            "customAttributes": [{"key": "OrderPilot-Batch", "value": BATCH_ID}]
+        })
+    );
+}
+
+#[test]
+fn order_input_maps_only_selected_customer_and_filled_address_fields() {
+    use orderpilot_lib::domain::{MailingAddress, ManualCustomer};
+    let source = format!("orderpilot/{BATCH_ID}/1");
+    let mut template = order_template();
+    template.customer = CustomerMode::Existing {
+        customer_id: "gid://shopify/Customer/42".into(),
+    };
+    let input = serde_json::to_value(
+        CreateOrderInput::from_template(template.clone(), &source, false).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        input["customer"],
+        json!({"toAssociate": {"id": "gid://shopify/Customer/42"}})
+    );
+    assert!(input.get("email").is_none());
+    assert!(input.get("shippingAddress").is_none());
+    template.customer = CustomerMode::Manual {
+        customer: ManualCustomer {
+            email: Some("alice@example.com".into()),
+            first_name: Some("Alice".into()),
+            last_name: Some(" ".into()),
+            phone: None,
+            shipping_address: Some(MailingAddress {
+                address1: Some("1 Main Street".into()),
+                city: Some("London".into()),
+                address2: Some("".into()),
+                ..Default::default()
+            }),
+        },
+    };
+    let input = serde_json::to_value(
+        CreateOrderInput::from_template(template.clone(), &source, false).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        input["customer"],
+        json!({"toUpsert": {"email": "alice@example.com", "firstName": "Alice"}})
+    );
+    assert_eq!(input["email"], "alice@example.com");
+    assert_eq!(
+        input["shippingAddress"],
+        json!({"address1": "1 Main Street", "city": "London", "firstName": "Alice"})
+    );
+    assert!(input.get("phone").is_none());
+    template.customer = CustomerMode::Manual {
+        customer: ManualCustomer {
+            shipping_address: Some(MailingAddress::default()),
+            ..Default::default()
+        },
+    };
+    let input =
+        serde_json::to_value(CreateOrderInput::from_template(template, &source, false).unwrap())
+            .unwrap();
+    for key in ["customer", "shippingAddress", "email", "phone"] {
+        assert!(input.get(key).is_none(), "unexpected {key}: {input}");
+    }
+}
 
 fn credentials() -> StoreCredentials {
     StoreCredentials {

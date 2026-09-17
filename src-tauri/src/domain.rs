@@ -111,6 +111,84 @@ pub struct OrderTemplate {
     pub financial_status: FinancialStatus,
 }
 
+impl OrderTemplate {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.quantity == 0 || self.quantity > i32::MAX as u32 {
+            return Err(AppError::validation(
+                "INVALID_ORDER_QUANTITY",
+                "每单商品数量必须为有效的正整数",
+            ));
+        }
+        if !valid_shopify_gid(&self.variant_id, "ProductVariant") {
+            return Err(AppError::validation(
+                "INVALID_VARIANT_ID",
+                "请选择具体的 Shopify 商品变体",
+            ));
+        }
+        if let CustomerMode::Existing { customer_id } = &self.customer {
+            if !valid_shopify_gid(customer_id, "Customer") {
+                return Err(AppError::validation(
+                    "INVALID_CUSTOMER_ID",
+                    "请选择有效的 Shopify 客户",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn valid_shopify_gid(value: &str, kind: &str) -> bool {
+    value
+        .strip_prefix(&format!("gid://shopify/{kind}/"))
+        .is_some_and(|id| {
+            !id.is_empty()
+                && id.bytes().all(|byte| byte.is_ascii_digit())
+                && id.parse::<u64>().is_ok_and(|id| id > 0)
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+pub enum BatchItemStatus {
+    Queued,
+    Creating,
+    Succeeded,
+    Failed,
+    Uncertain,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchJob {
+    pub id: String,
+    pub store_id: Option<String>,
+    pub order_template_json: String,
+    pub requested_count: i64,
+    pub status: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchItem {
+    pub id: String,
+    pub batch_id: String,
+    pub sequence_number: i64,
+    pub source_identifier: String,
+    pub status: BatchItemStatus,
+    pub attempt_count: i64,
+    pub shopify_order_id: Option<String>,
+    pub shopify_order_name: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

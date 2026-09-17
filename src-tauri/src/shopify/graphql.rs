@@ -7,10 +7,226 @@ use reqwest::{
     Client, Url,
 };
 use secrecy::ExposeSecret;
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::domain::{CustomerMode, FinancialStatus, MailingAddress, OrderTemplate};
 use crate::{domain::normalize_shop_domain, error::AppError, repository::StoreCredentials};
+
+/// Validated mutation input. Private fields prevent bypassing paid confirmation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateOrderInput {
+    line_items: Vec<CreateLineItem>,
+    financial_status: FinancialStatus,
+    source_identifier: String,
+    custom_attributes: Vec<CustomAttribute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    customer: Option<CreateCustomer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shipping_address: Option<CreateShippingAddress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedOrder {
+    pub id: String,
+    pub name: String,
+}
+
+pub(crate) const CREATE_ORDER_MUTATION: &str = "mutation CreateOrder($order: OrderCreateOrderInput!) { orderCreate(order: $order) { order { id name } userErrors { field message code } } }";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateOrderData {
+    pub order_create: CreateOrderPayload,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateOrderPayload {
+    pub order: Option<CreatedOrder>,
+    user_errors: Vec<OrderUserError>,
+}
+
+#[derive(Deserialize)]
+struct OrderUserError {
+    field: Option<Vec<String>>,
+    message: String,
+    code: Option<String>,
+}
+
+impl CreateOrderData {
+    pub(crate) fn into_order(self) -> Result<CreatedOrder, AppError> {
+        if !self.order_create.user_errors.is_empty() {
+            let messages = self
+                .order_create
+                .user_errors
+                .into_iter()
+                .map(|error| {
+                    let field = error.field.unwrap_or_default().join(".");
+                    let code = error.code.unwrap_or_else(|| "UNKNOWN".into());
+                    format!("[{code}] {field}: {}", error.message)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(AppError::validation("SHOPIFY_USER_ERROR", messages));
+        }
+        self.order_create
+            .order
+            .filter(|order| {
+                crate::domain::valid_shopify_gid(&order.id, "Order")
+                    && !order.name.trim().is_empty()
+            })
+            .ok_or_else(invalid_response)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum CreateCustomer {
+    ToAssociate { id: String },
+    ToUpsert(CustomerDetails),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomerDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateShippingAddress {
+    #[serde(flatten)]
+    address: MailingAddress,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateLineItem {
+    variant_id: String,
+    quantity: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CustomAttribute {
+    key: String,
+    value: String,
+}
+
+impl CreateOrderInput {
+    pub fn from_template(
+        template: OrderTemplate,
+        source: &str,
+        paid_confirmed: bool,
+    ) -> Result<Self, AppError> {
+        if template.financial_status == FinancialStatus::Paid && !paid_confirmed {
+            return Err(AppError::validation(
+                "PAID_CONFIRMATION_REQUIRED",
+                "标记已付款前必须明确确认已通过其他渠道收款",
+            ));
+        }
+        template.validate()?;
+        let batch_id = source
+            .strip_prefix("orderpilot/")
+            .and_then(|suffix| suffix.split_once('/'))
+            .filter(|(batch, sequence)| {
+                uuid::Uuid::parse_str(batch).is_ok_and(|uuid| uuid.to_string() == *batch)
+                    && sequence.parse::<u16>().is_ok_and(|number| {
+                        (1..=100).contains(&number) && number.to_string() == *sequence
+                    })
+            })
+            .map(|(batch, _)| batch)
+            .ok_or_else(|| {
+                AppError::validation("INVALID_SOURCE_IDENTIFIER", "批次项来源标识无效")
+            })?;
+        let mut input = Self {
+            line_items: vec![CreateLineItem {
+                variant_id: template.variant_id,
+                quantity: template.quantity,
+            }],
+            financial_status: template.financial_status,
+            source_identifier: source.into(),
+            custom_attributes: vec![CustomAttribute {
+                key: "OrderPilot-Batch".into(),
+                value: batch_id.into(),
+            }],
+            customer: None,
+            email: None,
+            phone: None,
+            shipping_address: None,
+        };
+        match template.customer {
+            CustomerMode::None => {}
+            CustomerMode::Existing { customer_id } => {
+                input.customer = Some(CreateCustomer::ToAssociate { id: customer_id });
+            }
+            CustomerMode::Manual { customer } => {
+                let details = CustomerDetails {
+                    email: filled(customer.email),
+                    first_name: filled(customer.first_name),
+                    last_name: filled(customer.last_name),
+                    phone: filled(customer.phone),
+                };
+                input.email = details.email.clone();
+                input.phone = details.phone.clone();
+                input.shipping_address =
+                    customer
+                        .shipping_address
+                        .and_then(filled_address)
+                        .map(|address| CreateShippingAddress {
+                            address,
+                            first_name: details.first_name.clone(),
+                            last_name: details.last_name.clone(),
+                            phone: details.phone.clone(),
+                        });
+                if details.email.is_some()
+                    || details.first_name.is_some()
+                    || details.last_name.is_some()
+                    || details.phone.is_some()
+                {
+                    input.customer = Some(CreateCustomer::ToUpsert(details));
+                }
+            }
+        }
+        Ok(input)
+    }
+}
+
+fn filled(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn filled_address(address: MailingAddress) -> Option<MailingAddress> {
+    let address = MailingAddress {
+        address1: filled(address.address1),
+        address2: filled(address.address2),
+        city: filled(address.city),
+        province: filled(address.province),
+        country: filled(address.country),
+        zip: filled(address.zip),
+    };
+    (address != MailingAddress::default()).then_some(address)
+}
 
 pub const GRAPHQL_PATH: &str = "/admin/api/2026-07/graphql.json";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -244,5 +460,56 @@ fn redact_token(value: &mut Value, token: &str) {
                 .collect();
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod order_response_tests {
+    use super::*;
+
+    #[test]
+    fn order_success_requires_both_a_gid_and_nonempty_name() {
+        let valid: CreateOrderData = serde_json::from_value(json!({"orderCreate": {
+            "order": {"id": "gid://shopify/Order/42", "name": "#1042"}, "userErrors": []
+        }}))
+        .unwrap();
+        assert_eq!(
+            valid.into_order().unwrap(),
+            CreatedOrder {
+                id: "gid://shopify/Order/42".into(),
+                name: "#1042".into()
+            }
+        );
+        for order in [
+            Value::Null,
+            json!({"id": "", "name": "#1042"}),
+            json!({"id": "gid://shopify/Order/42", "name": " "}),
+        ] {
+            let data: CreateOrderData =
+                serde_json::from_value(json!({"orderCreate": {"order": order, "userErrors": []}}))
+                    .unwrap();
+            assert_eq!(
+                data.into_order().unwrap_err().code(),
+                "SHOPIFY_INVALID_RESPONSE"
+            );
+        }
+    }
+
+    #[test]
+    fn order_user_errors_take_precedence_and_preserve_codes_and_messages() {
+        let data: CreateOrderData = serde_json::from_value(json!({"orderCreate": {
+            "order": {"id": "gid://shopify/Order/42", "name": "#1042"},
+            "userErrors": [
+                {"field": ["order", "shippingAddress"], "message": "Invalid address", "code": "INVALID"},
+                {"field": null, "message": "Variant unavailable", "code": "VARIANT_NOT_FOUND"}
+            ]
+        }})).unwrap();
+        let error = data.into_order().unwrap_err();
+        assert_eq!(error.code(), "SHOPIFY_USER_ERROR");
+        assert!(error.message().contains("INVALID"));
+        assert!(error.message().contains("Invalid address"));
+        assert!(error.message().contains("VARIANT_NOT_FOUND"));
+        assert!(error.message().contains("Variant unavailable"));
+        assert!(!error.retryable());
     }
 }

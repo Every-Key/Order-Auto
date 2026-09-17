@@ -1,6 +1,219 @@
+use orderpilot_lib::domain::{BatchSize, CustomerMode, FinancialStatus, OrderTemplate};
 use orderpilot_lib::repository::{NewStore, Repository, UpdateStore};
 use secrecy::{ExposeSecret, SecretString};
 use tempfile::TempDir;
+
+fn template() -> OrderTemplate {
+    OrderTemplate {
+        variant_id: "gid://shopify/ProductVariant/123".into(),
+        quantity: 2,
+        customer: CustomerMode::None,
+        financial_status: FinancialStatus::Pending,
+    }
+}
+
+#[tokio::test]
+async fn batch_items_allow_only_legal_transitions_and_persist_results() {
+    use orderpilot_lib::domain::BatchItemStatus as Status;
+    use orderpilot_lib::error::AppError;
+    let (_directory, repo) = test_repository().await;
+    let store = batch_store(&repo).await;
+    let job = repo
+        .create_batch(&store, template(), BatchSize::new(4).unwrap())
+        .await
+        .unwrap();
+    let items = repo.list_batch_items(&job.id).await.unwrap();
+    assert_eq!(
+        repo.next_queued_item(&job.id).await.unwrap().unwrap().id,
+        items[0].id
+    );
+    assert_eq!(
+        repo.mark_succeeded(&items[0].id, "gid://shopify/Order/1", "#1001")
+            .await
+            .unwrap_err()
+            .code(),
+        "INVALID_ITEM_TRANSITION"
+    );
+    for item in &items[..3] {
+        repo.mark_creating(&item.id).await.unwrap();
+        assert_eq!(
+            repo.mark_creating(&item.id).await.unwrap_err().code(),
+            "INVALID_ITEM_TRANSITION"
+        );
+    }
+    repo.mark_succeeded(&items[0].id, "gid://shopify/Order/1", "#1001")
+        .await
+        .unwrap();
+    repo.mark_failed(
+        &items[1].id,
+        &AppError::validation("INVALID", "Address invalid"),
+    )
+    .await
+    .unwrap();
+    repo.mark_uncertain(
+        &items[2].id,
+        &AppError::validation("SHOPIFY_TIMEOUT", "Check result"),
+    )
+    .await
+    .unwrap();
+    repo.mark_stopped(&items[3].id).await.unwrap();
+    assert!(repo.next_queued_item(&job.id).await.unwrap().is_none());
+    let saved = repo.list_batch_items(&job.id).await.unwrap();
+    assert_eq!(
+        saved.iter().map(|i| i.status).collect::<Vec<_>>(),
+        vec![
+            Status::Succeeded,
+            Status::Failed,
+            Status::Uncertain,
+            Status::Stopped
+        ]
+    );
+    assert_eq!(
+        saved[0].shopify_order_id.as_deref(),
+        Some("gid://shopify/Order/1")
+    );
+    assert_eq!(saved[0].shopify_order_name.as_deref(), Some("#1001"));
+    assert_eq!(saved[1].error_code.as_deref(), Some("INVALID"));
+    assert_eq!(saved[1].error_message.as_deref(), Some("Address invalid"));
+    assert_eq!(saved[2].error_code.as_deref(), Some("SHOPIFY_TIMEOUT"));
+    for (index, item) in saved.iter().enumerate() {
+        assert_eq!(item.attempt_count, if index == 3 { 0 } else { 1 });
+        assert!(item.updated_at > item.created_at);
+        assert!(repo.mark_creating(&item.id).await.is_err());
+        assert!(repo.mark_stopped(&item.id).await.is_err());
+        assert!(repo
+            .mark_failed(&item.id, &AppError::validation("NO", "No"))
+            .await
+            .is_err());
+        assert!(repo
+            .mark_uncertain(&item.id, &AppError::validation("NO", "No"))
+            .await
+            .is_err());
+        assert!(repo
+            .mark_succeeded(&item.id, "overwrite", "overwrite")
+            .await
+            .is_err());
+    }
+    assert_eq!(repo.list_batch_items(&job.id).await.unwrap(), saved);
+}
+
+async fn batch_store(repo: &Repository) -> String {
+    repo.create_store(NewStore {
+        display_name: "Batch store".into(),
+        shop_domain: "batch-store".into(),
+        access_token: SecretString::from("shpat_secret"),
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn create_batch_rejects_invalid_templates_before_persisting() {
+    let (_directory, repo) = test_repository().await;
+    let store = batch_store(&repo).await;
+    let mut invalid = template();
+    invalid.quantity = 0;
+    assert_eq!(
+        repo.create_batch(&store, invalid, BatchSize::new(1).unwrap())
+            .await
+            .unwrap_err()
+            .code(),
+        "INVALID_ORDER_QUANTITY"
+    );
+    assert!(repo.list_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn competing_claims_only_increment_attempt_count_once() {
+    let (_directory, repo) = test_repository().await;
+    let store = batch_store(&repo).await;
+    let job = repo
+        .create_batch(&store, template(), BatchSize::new(1).unwrap())
+        .await
+        .unwrap();
+    let item = repo.next_queued_item(&job.id).await.unwrap().unwrap();
+    let (first, second) = tokio::join!(repo.mark_creating(&item.id), repo.mark_creating(&item.id));
+    assert_ne!(first.is_ok(), second.is_ok());
+    assert_eq!(
+        repo.list_batch_items(&job.id).await.unwrap()[0].attempt_count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn create_batch_rolls_back_job_and_items_when_a_later_insert_fails() {
+    let (directory, repo) = test_repository().await;
+    let store_id = batch_store(&repo).await;
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        directory.path().join("orderpilot.sqlite").display()
+    ))
+    .await
+    .unwrap();
+    // Inject a storage failure after the job and first item have been written.
+    sqlx::query("CREATE TRIGGER reject_second_item BEFORE INSERT ON batch_items WHEN NEW.sequence_number = 2 BEGIN SELECT RAISE(ABORT, 'injected failure'); END").execute(&pool).await.unwrap();
+    let error = repo
+        .create_batch(&store_id, template(), BatchSize::new(3).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "DATABASE_ERROR");
+    assert!(repo.list_batches().await.unwrap().is_empty());
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM batch_items")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+#[tokio::test]
+async fn create_batch_freezes_template_and_persists_ordered_unique_items() {
+    let (directory, repo) = test_repository().await;
+    let store_id = batch_store(&repo).await;
+    let mut draft = template();
+    let job = repo
+        .create_batch(&store_id, draft.clone(), BatchSize::new(3).unwrap())
+        .await
+        .unwrap();
+    draft.quantity = 99;
+    let reopened = Repository::connect(directory.path().join("orderpilot.sqlite"))
+        .await
+        .unwrap();
+    let saved = reopened.get_batch(&job.id).await.unwrap();
+    assert_eq!(
+        saved.order_template_json,
+        serde_json::to_string(&template()).unwrap()
+    );
+    assert_eq!(saved.requested_count, 3);
+    assert_eq!(saved.status, "pending");
+    assert_eq!(saved.store_id.as_deref(), Some(store_id.as_str()));
+    let items = reopened.list_batch_items(&job.id).await.unwrap();
+    assert_eq!(items.len(), 3);
+    for (index, item) in items.iter().enumerate() {
+        assert_eq!(item.sequence_number, index as i64 + 1);
+        assert_eq!(
+            item.source_identifier,
+            format!("orderpilot/{}/{}", job.id, index + 1)
+        );
+        assert_eq!(item.attempt_count, 0);
+        assert_eq!(serde_json::to_value(&item.status).unwrap(), "queued");
+    }
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| &item.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
+    let second = reopened
+        .create_batch(&store_id, draft, BatchSize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_ne!(
+        reopened.list_batch_items(&second.id).await.unwrap()[0].source_identifier,
+        items[0].source_identifier
+    );
+}
 
 async fn test_repository() -> (TempDir, Repository) {
     let directory = tempfile::tempdir().unwrap();

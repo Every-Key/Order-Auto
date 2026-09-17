@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::AppError, repository::StoreCredentials};
-pub use graphql::ShopifyHttpClient;
+pub use graphql::{CreateOrderInput, CreatedOrder, ShopifyHttpClient};
 
 pub const REQUIRED_SCOPES: [&str; 4] = [
     "read_products",
@@ -61,6 +61,11 @@ pub struct CustomerAddress {
 /// Shopify operations cross this seam while credentials and transport stay in Rust.
 #[async_trait]
 pub trait ShopifyGateway: Send + Sync {
+    async fn create_order(
+        &self,
+        store: &StoreCredentials,
+        input: CreateOrderInput,
+    ) -> Result<CreatedOrder, AppError>;
     async fn test_connection(&self, store: &StoreCredentials)
         -> Result<ConnectionReport, AppError>;
     async fn search_variants(
@@ -77,6 +82,21 @@ pub trait ShopifyGateway: Send + Sync {
 
 #[async_trait]
 impl ShopifyGateway for ShopifyHttpClient {
+    async fn create_order(
+        &self,
+        store: &StoreCredentials,
+        input: CreateOrderInput,
+    ) -> Result<CreatedOrder, AppError> {
+        let data: graphql::CreateOrderData = self
+            .execute(
+                store,
+                graphql::CREATE_ORDER_MUTATION,
+                &serde_json::json!({"order": input}),
+            )
+            .await?;
+        data.into_order()
+    }
+
     async fn test_connection(
         &self,
         store: &StoreCredentials,

@@ -6,7 +6,12 @@ use serde::Serialize;
 use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
 use uuid::Uuid;
 
-use crate::{domain::normalize_shop_domain, error::AppError};
+use crate::{
+    domain::{
+        normalize_shop_domain, BatchItem, BatchItemStatus, BatchJob, BatchSize, OrderTemplate,
+    },
+    error::AppError,
+};
 
 #[derive(Clone)]
 pub struct Repository {
@@ -56,6 +61,126 @@ pub struct BatchSummary {
 }
 
 impl Repository {
+    /// Observation only: callers must successfully mark_creating before submitting.
+    pub async fn next_queued_item(&self, batch_id: &str) -> Result<Option<BatchItem>, AppError> {
+        sqlx::query_as::<_, BatchItem>("SELECT * FROM batch_items WHERE batch_id = ? AND status = 'queued' ORDER BY sequence_number LIMIT 1")
+            .bind(batch_id).fetch_optional(&self.pool).await.map_err(database_error)
+    }
+
+    pub async fn mark_creating(&self, id: &str) -> Result<(), AppError> {
+        self.transition_item(id, ItemTransition::Creating).await
+    }
+
+    pub async fn mark_succeeded(
+        &self,
+        id: &str,
+        order_id: &str,
+        order_name: &str,
+    ) -> Result<(), AppError> {
+        self.transition_item(
+            id,
+            ItemTransition::Succeeded {
+                order_id,
+                order_name,
+            },
+        )
+        .await
+    }
+
+    pub async fn mark_failed(&self, id: &str, error: &AppError) -> Result<(), AppError> {
+        self.transition_item(id, ItemTransition::Failed(error))
+            .await
+    }
+
+    pub async fn mark_uncertain(&self, id: &str, error: &AppError) -> Result<(), AppError> {
+        self.transition_item(id, ItemTransition::Uncertain(error))
+            .await
+    }
+
+    pub async fn mark_stopped(&self, id: &str) -> Result<(), AppError> {
+        self.transition_item(id, ItemTransition::Stopped).await
+    }
+
+    async fn transition_item(
+        &self,
+        id: &str,
+        transition: ItemTransition<'_>,
+    ) -> Result<(), AppError> {
+        use BatchItemStatus::*;
+        let (from, to, order_id, order_name, error) = match transition {
+            ItemTransition::Creating => (Queued, Creating, None, None, None),
+            ItemTransition::Succeeded {
+                order_id,
+                order_name,
+            } => (Creating, Succeeded, Some(order_id), Some(order_name), None),
+            ItemTransition::Failed(error) => (Creating, Failed, None, None, Some(error)),
+            ItemTransition::Uncertain(error) => (Creating, Uncertain, None, None, Some(error)),
+            ItemTransition::Stopped => (Queued, Stopped, None, None, None),
+        };
+        // A conditional single write guards concurrent callers and keeps results/timestamp atomic.
+        let result = sqlx::query("UPDATE batch_items SET status = ?, attempt_count = attempt_count + ?, shopify_order_id = ?, shopify_order_name = ?, error_code = ?, error_message = ?, updated_at = ? WHERE id = ? AND status = ?")
+            .bind(to).bind(i64::from(to == Creating)).bind(order_id).bind(order_name)
+            .bind(error.map(AppError::code)).bind(error.map(AppError::message)).bind(Utc::now().to_rfc3339())
+            .bind(id).bind(from).execute(&self.pool).await.map_err(database_error)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::validation(
+                "INVALID_ITEM_TRANSITION",
+                "批次项不存在或当前状态不允许此操作",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn create_batch(
+        &self,
+        store_id: &str,
+        template: OrderTemplate,
+        size: BatchSize,
+    ) -> Result<BatchJob, AppError> {
+        template.validate()?;
+        let job = BatchJob {
+            id: Uuid::new_v4().to_string(),
+            store_id: Some(store_id.into()),
+            order_template_json: serde_json::to_string(&template).map_err(database_error)?,
+            requested_count: i64::from(size.get()),
+            status: "pending".into(),
+            created_at: Utc::now().to_rfc3339(),
+            started_at: None,
+            finished_at: None,
+        };
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("INSERT INTO batch_jobs (id, store_id, order_template_json, requested_count, status, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&job.id).bind(store_id).bind(&job.order_template_json).bind(job.requested_count)
+            .bind(&job.status).bind(&job.created_at).execute(&mut *transaction).await.map_err(database_error)?;
+        for sequence in 1..=size.get() {
+            sqlx::query("INSERT INTO batch_items (id, batch_id, sequence_number, source_identifier, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?)")
+                .bind(Uuid::new_v4().to_string()).bind(&job.id).bind(i64::from(sequence))
+                .bind(format!("orderpilot/{}/{sequence}", job.id)).bind(&job.created_at).bind(&job.created_at)
+                .execute(&mut *transaction).await.map_err(database_error)?;
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(job)
+    }
+
+    pub async fn get_batch(&self, id: &str) -> Result<BatchJob, AppError> {
+        sqlx::query_as::<_, BatchJob>("SELECT * FROM batch_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| AppError::validation("BATCH_NOT_FOUND", "未找到批次"))
+    }
+
+    pub async fn list_batch_items(&self, batch_id: &str) -> Result<Vec<BatchItem>, AppError> {
+        sqlx::query_as::<_, BatchItem>(
+            "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY sequence_number",
+        )
+        .bind(batch_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, AppError> {
         let path = path.as_ref();
         let in_memory = path == Path::new(":memory:");
@@ -213,6 +338,17 @@ impl Repository {
         .await
         .map_err(database_error)
     }
+}
+
+enum ItemTransition<'a> {
+    Creating,
+    Succeeded {
+        order_id: &'a str,
+        order_name: &'a str,
+    },
+    Failed(&'a AppError),
+    Uncertain(&'a AppError),
+    Stopped,
 }
 
 fn escape_like(value: &str) -> String {
