@@ -1,0 +1,13 @@
+:root {
+  color: #17212b;
+  background: #f6f7f9;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  padding: 2rem;
+}
