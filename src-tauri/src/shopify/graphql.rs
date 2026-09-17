@@ -113,15 +113,12 @@ impl ShopifyHttpClient {
             let body = response.bytes().await.map_err(network_error)?;
             let envelope: Envelope =
                 serde_json::from_slice(&body).map_err(|_| invalid_response())?;
-            if envelope
+            if let Some(errors) = envelope
                 .errors
-                .as_ref()
-                .is_some_and(|errors| !errors.is_empty())
+                .as_deref()
+                .filter(|errors| !errors.is_empty())
             {
-                return Err(AppError::validation(
-                    "SHOPIFY_GRAPHQL",
-                    "Shopify GraphQL 请求失败，请检查权限和请求参数",
-                ));
+                return Err(graphql_error(errors));
             }
             let mut data = envelope.data.ok_or_else(invalid_response)?;
             redact_token(&mut data, store.access_token.expose_secret());
@@ -162,6 +159,44 @@ fn http_error(status: u16) -> AppError {
         }
         _ => AppError::validation("SHOPIFY_HTTP", "Shopify HTTP 请求失败"),
     }
+}
+
+fn graphql_error(errors: &[Value]) -> AppError {
+    if errors.iter().any(is_protected_customer_data_denial) {
+        AppError::validation(
+            "CUSTOMER_DATA_RESTRICTED",
+            "此应用尚未获准访问 Shopify 受保护的客户数据",
+        )
+    } else {
+        AppError::validation(
+            "SHOPIFY_GRAPHQL",
+            "Shopify GraphQL 请求失败，请检查权限和请求参数",
+        )
+    }
+}
+
+fn is_protected_customer_data_denial(error: &Value) -> bool {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let documentation = error
+        .pointer("/extensions/documentation")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let code = error
+        .pointer("/extensions/code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mentions_protected_data = message.contains("protected customer data")
+        || documentation.contains("protected-customer-data")
+        || documentation.contains("customer_data");
+    let is_denial = code == "ACCESS_DENIED"
+        || message.contains("access denied")
+        || message.contains("not approved");
+    mentions_protected_data && is_denial
 }
 
 fn retry_after_delay(value: &str) -> Option<Duration> {

@@ -438,3 +438,202 @@ async fn test_connection_uses_pinned_graphql_endpoint_and_token_header() {
         .contains("currentAppInstallation"));
     assert!(!body.to_string().contains("shpat_secret"));
 }
+
+#[tokio::test]
+async fn search_variants_maps_products_to_selectable_variants() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "shop": {"currencyCode": "USD"},
+            "productVariants": {"nodes": [
+                {
+                    "id": "gid://shopify/ProductVariant/101",
+                    "title": "Navy / M",
+                    "sku": "HD-NV-M",
+                    "price": "49.95",
+                    "inventoryQuantity": 7,
+                    "product": {"title": "Hoodie"}
+                },
+                {
+                    "id": "gid://shopify/ProductVariant/102",
+                    "title": "Navy / L",
+                    "sku": null,
+                    "price": "49.95",
+                    "inventoryQuantity": 0,
+                    "product": {"title": "Hoodie"}
+                }
+            ]}
+        }})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let rows = ShopifyHttpClient::new(Some(server.uri()))
+        .unwrap()
+        .search_variants(&credentials(), "  hoodie  ")
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, "gid://shopify/ProductVariant/101");
+    assert_eq!(rows[0].product_title, "Hoodie");
+    assert_eq!(rows[0].variant_title, "Navy / M");
+    assert_eq!(rows[0].sku.as_deref(), Some("HD-NV-M"));
+    assert_eq!(rows[0].price, "49.95");
+    assert_eq!(rows[0].currency_code, "USD");
+    assert_eq!(rows[0].inventory_quantity, 7);
+    assert_eq!(rows[1].sku, None);
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    assert_eq!(body["variables"]["query"], "\"hoodie\" OR sku:\"hoodie\"");
+    assert!(body["query"]
+        .as_str()
+        .unwrap()
+        .contains("productVariants(first: 20, query: $query)"));
+    assert!(!body["query"].as_str().unwrap().contains("hoodie"));
+}
+
+#[tokio::test]
+async fn search_customers_maps_nullable_contact_and_address_data() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "customers": {"nodes": [
+                {
+                    "id": "gid://shopify/Customer/201",
+                    "displayName": "Alice Wu",
+                    "defaultEmailAddress": {"emailAddress": "alice@example.com"},
+                    "defaultPhoneNumber": null,
+                    "defaultAddress": {
+                        "firstName": "Alice",
+                        "lastName": "Wu",
+                        "company": null,
+                        "address1": "1 Market Street",
+                        "address2": null,
+                        "city": "San Francisco",
+                        "provinceCode": "CA",
+                        "countryCodeV2": "US",
+                        "zip": "94105"
+                    }
+                },
+                {
+                    "id": "gid://shopify/Customer/202",
+                    "displayName": "No contact details",
+                    "defaultEmailAddress": null,
+                    "defaultPhoneNumber": null,
+                    "defaultAddress": null
+                }
+            ]}
+        }})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let rows = ShopifyHttpClient::new(Some(server.uri()))
+        .unwrap()
+        .search_customers(&credentials(), "  alice  ")
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, "gid://shopify/Customer/201");
+    assert_eq!(rows[0].display_name, "Alice Wu");
+    assert_eq!(rows[0].email.as_deref(), Some("alice@example.com"));
+    assert_eq!(rows[0].phone, None);
+    let address = rows[0].default_address.as_ref().unwrap();
+    assert_eq!(address.address1.as_deref(), Some("1 Market Street"));
+    assert_eq!(address.address2, None);
+    assert_eq!(address.country_code.as_deref(), Some("US"));
+    assert_eq!(rows[1].email, None);
+    assert_eq!(rows[1].phone, None);
+    assert_eq!(rows[1].default_address, None);
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    assert_eq!(body["variables"]["query"], "\"alice\"");
+    assert!(body["query"]
+        .as_str()
+        .unwrap()
+        .contains("customers(first: 20, query: $query)"));
+    assert!(!body["query"].as_str().unwrap().contains("alice"));
+}
+
+#[tokio::test]
+async fn search_customers_reports_protected_customer_data_separately() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"customers": null},
+            "errors": [{
+                "message": "Access denied for customers field. Apps must be approved for protected customer data.",
+                "extensions": {"code": "ACCESS_DENIED"}
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = ShopifyHttpClient::new(Some(server.uri()))
+        .unwrap()
+        .search_customers(&credentials(), "alice")
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "CUSTOMER_DATA_RESTRICTED");
+    assert!(!error.retryable());
+    assert_redacted(&error);
+}
+
+#[tokio::test]
+async fn search_rejects_blank_and_overlong_text_before_transport_validation() {
+    let client = ShopifyHttpClient::new(None).unwrap();
+    let invalid_store = StoreCredentials {
+        shop_domain: "not-a-shopify-domain".into(),
+        access_token: SecretString::from("shpat_secret\ninvalid"),
+    };
+    let overlong = "界".repeat(121);
+
+    for query in ["   ", overlong.as_str()] {
+        let variant_error = client
+            .search_variants(&invalid_store, query)
+            .await
+            .unwrap_err();
+        assert_eq!(variant_error.code(), "SHOPIFY_SEARCH_QUERY");
+        assert!(!variant_error.retryable());
+
+        let customer_error = client
+            .search_customers(&invalid_store, query)
+            .await
+            .unwrap_err();
+        assert_eq!(customer_error.code(), "SHOPIFY_SEARCH_QUERY");
+        assert!(!customer_error.retryable());
+    }
+}
+
+#[tokio::test]
+async fn search_accepts_120_characters_and_returns_empty_results() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "shop": {"currencyCode": "USD"},
+            "productVariants": {"nodes": []},
+            "customers": {"nodes": []}
+        }})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = ShopifyHttpClient::new(Some(server.uri())).unwrap();
+    let query = "界".repeat(120);
+
+    assert!(client
+        .search_variants(&credentials(), &query)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(client
+        .search_customers(&credentials(), &query)
+        .await
+        .unwrap()
+        .is_empty());
+}
